@@ -402,9 +402,10 @@ int main(int argc, char** argv) {
     double maxFrames = (maxNs / 1000000.0) / frameTimeMs;
 
     printf("\n");
-    printf("==========================================\n");
-    printf("           RESULTATS FINAUX              \n");
-    printf("==========================================\n\n");
+    printf("\n========================================\n");
+    printf("   inputlag-tester (Auto-Detect Hz)\n");
+    printf("========================================\n\n");
+
     printf("[*] Input -> DXGI Capture Latency (milliseconds)\n");
     printf("    Samples       : %zu\n", g_results.size());
     printf("    Min           : %.2f ms (%.2f frames)\n", minNs / 1000000.0, minFrames);
@@ -436,10 +437,10 @@ int main(int argc, char** argv) {
     printf("[+] Test completed successfully\n\n");
 
     // Simple context explanation
-    printf("Note: ces mesures représentent le temps entre un mouvement souris\n");
-    printf("      et la détection du changement d'image par DXGI sur Windows.\n");
-    printf("      Elles n'incluent pas exactement le temps d'affichage réel\n");
-    printf("      (scanout + réponse du panneau), qui nécessite un capteur sur l'écran.\n\n");
+    printf("Note: these measurements represent the time between a mouse movement\n");
+    printf("      and DXGI detecting a frame change on Windows.\n");
+    printf("      They do not include the exact display output time\n");
+    printf("      (scan-out + panel response), which requires a hardware sensor.\n\n");
 
     return 0;
 }
