@@ -61,8 +61,8 @@ Pre-built Windows binaries are automatically published in the **Releases** tab w
 
 Here an example for expected output (output from my computer, below my computer specs)
 
-- AMD 7700x
-- Nvidia RTX 4080
+- AMD Ryzen 7 7700x 8-core
+- Nvidia GeForce RTX 4080
 - écran ROG PG27AQN (IPS 360Hz screen) en DisplayPort
 - Windows 11 25H2
 
@@ -92,27 +92,33 @@ Monitor: 360Hz (2.78 ms per frame)
 [210/210] Latency: 0.44 ms (0.16 frames)
 
 ==========================================
-           RESULTATS FINAUX
+              FINAL RESULTS
 ==========================================
+
+[SYS ] CPU           : AMD Ryzen 7 7700X 8-Core Processor
+[SYS ] GPU           : NVIDIA GeForce RTX 4080
+[SYS ] Driver        : 32.0.15.9159
+[SYS ] Monitor       : \\.\DISPLAY1
+[SYS ] Refresh Rate  : 360 Hz
 
 [*] Input -> DXGI Capture Latency (milliseconds)
     Samples       : 200
-    Min           : 0.24 ms (0.09 frames)
-    P50 (Median)  : 0.43 ms (0.16 frames)
-    Avg           : 0.45 ms (0.16 frames)
-    P95           : 0.69 ms (0.25 frames)
-    P99           : 0.81 ms (0.29 frames)
-    Max           : 0.86 ms (0.31 frames)
-    Std Dev       : 0.12 ms
+    Min           : 0.34 ms (0.12 frames)
+    P50 (Median)  : 0.58 ms (0.21 frames)
+    Avg           : 0.60 ms (0.21 frames)
+    P95           : 0.83 ms (0.30 frames)
+    P99           : 1.06 ms (0.38 frames)
+    Max           : 1.17 ms (0.42 frames)
+    Std Dev       : 0.13 ms
 
 [*] Monitor Analysis (360Hz)
     Frame time    : 2.78 ms
-    Verdict       : EXCELLENT - Under 1 frame lag
+    Verdict       : EXCELLENT - Under 1 frame of lag
 
 [*] Test Characteristics
-    Test Duration : 16436 ms
-    Measurement Rate : 12.17 Hz
-    Interval      : 50 ms
+    Test Duration : 6582 ms
+    Measurement Rate : 30.39 Hz
+    Interval      : 1 ms
 
 [+] Test completed successfully
 

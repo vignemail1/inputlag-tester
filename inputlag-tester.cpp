@@ -24,6 +24,13 @@
 using Microsoft::WRL::ComPtr;
 using namespace std::chrono;
 
+// Infos système pour le récapitulatif final
+static std::string g_cpuName;
+static std::string g_gpuName;
+static std::string g_monitorName;
+static std::string g_driverVersion;   // <-- nouveau
+static int g_monitorHz = 0;
+
 std::string GetCpuName()
 {
     HKEY hKey;
@@ -103,8 +110,30 @@ public:
             char gpuName[128] = {};
             size_t converted = 0;
             wcstombs_s(&converted, gpuName, sizeof(gpuName), adapterDesc.Description, _TRUNCATE);
-            printf("[SYS ] GPU           : %s\n", gpuName);
+            g_gpuName = gpuName;
         }
+
+        // Driver version via CheckInterfaceSupport
+        // Driver version via CheckInterfaceSupport (DXGI UMD)
+        {
+            LARGE_INTEGER umdVersion = {};
+            HRESULT hrVer = adapter->CheckInterfaceSupport(__uuidof(IDXGIDevice), &umdVersion);
+            if (SUCCEEDED(hrVer)) {
+                UINT major    = HIWORD(umdVersion.HighPart);
+                UINT minor    = LOWORD(umdVersion.HighPart);
+                UINT build    = HIWORD(umdVersion.LowPart);
+                UINT revision = LOWORD(umdVersion.LowPart);
+
+                char drvBuf[64] = {};
+                sprintf_s(drvBuf, "%u.%u.%u.%u", major, minor, build, revision);
+                g_driverVersion = drvBuf;
+                printf("[DXGI] OK Driver UMD version: %s\n", drvBuf);
+            } else {
+                printf("[DXGI] INFO Could not query driver version (hr=0x%X)\n", hrVer);
+                g_driverVersion = "Unknown";
+            }
+        }
+
 
         ComPtr<IDXGIOutput> output;
         hr = adapter->EnumOutputs(0, output.ReleaseAndGetAddressOf());
@@ -127,7 +156,8 @@ public:
             char monitorName[64] = {};
             size_t converted2 = 0;
             wcstombs_s(&converted2, monitorName, sizeof(monitorName), outputDesc.DeviceName, _TRUNCATE);
-            printf("[SYS ] Monitor       : %s\n", monitorName);
+            g_monitorName = monitorName;
+            g_monitorHz   = refreshRateHz;
 
             if (regionX_ == 0 && regionY_ == 0 && regionW_ == 0 && regionH_ == 0) {
                 regionW_ = 200;
@@ -294,8 +324,7 @@ int main(int argc, char** argv) {
     printf("   inputlag-tester (Auto-Detect Hz)\n");
     printf("========================================\n\n");
 
-    std::string cpuName = GetCpuName();
-    printf("[SYS ] CPU           : %s\n", cpuName.c_str());
+    g_cpuName = GetCpuName();
 
     int regionX = 0, regionY = 0, regionW = 0, regionH = 0;
     int numSamples = 210;
@@ -458,6 +487,14 @@ int main(int argc, char** argv) {
     printf("==========================================\n");
     printf("              FINAL RESULTS               \n");
     printf("==========================================\n\n");
+
+    // ---- SYS block ----
+    printf("[SYS ] CPU           : %s\n", g_cpuName.c_str());
+    printf("[SYS ] GPU           : %s\n", g_gpuName.empty() ? "Unknown GPU" : g_gpuName.c_str());
+    printf("[SYS ] Driver        : %s\n", g_driverVersion.empty() ? "Unknown" : g_driverVersion.c_str());
+    printf("[SYS ] Monitor       : %s\n", g_monitorName.empty() ? "Unknown Monitor" : g_monitorName.c_str());
+    printf("[SYS ] Refresh Rate  : %d Hz\n\n", g_monitorHz > 0 ? g_monitorHz : capture.refreshRateHz);
+
     printf("[*] Input -> DXGI Capture Latency (milliseconds)\n");
     printf("    Samples       : %zu\n", g_results.size());
     printf("    Min           : %.2f ms (%.2f frames)\n", minNs / 1000000.0, minFrames);
