@@ -24,12 +24,23 @@
 using Microsoft::WRL::ComPtr;
 using namespace std::chrono;
 
-// Infos système pour le récapitulatif final
+// Infos système / run
 static std::string g_cpuName;
 static std::string g_gpuName;
 static std::string g_monitorName;
-static std::string g_driverVersion;   // <-- nouveau
+static std::string g_gpuVram;
 static int g_monitorHz = 0;
+
+// New: infos carte mère / BIOS
+static std::string g_mbVendor;
+static std::string g_mbProduct;
+static std::string g_biosVersion;
+
+// Résultats + sortie fichier
+static std::vector<int64_t> g_results;
+static std::string g_outputFilePath;
+
+// -------- Helpers système --------
 
 std::string GetCpuName()
 {
@@ -62,6 +73,91 @@ std::string GetCpuName()
 
     return std::string(buffer);
 }
+
+std::string GetOsVersionString()
+{
+    OSVERSIONINFOEXA osvi = {};
+    osvi.dwOSVersionInfoSize = sizeof(osvi);
+#pragma warning(push)
+#pragma warning(disable:4996) // GetVersionEx deprecated warning
+    if (!GetVersionExA((OSVERSIONINFOA*)&osvi)) {
+#pragma warning(pop)
+        return "Unknown OS";
+    }
+
+    char buf[128] = {};
+    sprintf_s(buf, "Windows %lu.%lu (build %lu)",
+              osvi.dwMajorVersion,
+              osvi.dwMinorVersion,
+              osvi.dwBuildNumber);
+    return std::string(buf);
+}
+
+std::string GetCpuLogicalCoresString()
+{
+    SYSTEM_INFO si = {};
+    GetSystemInfo(&si);
+    char buf[64] = {};
+    sprintf_s(buf, "%u logical cores", si.dwNumberOfProcessors);
+    return std::string(buf);
+}
+
+std::string FormatBytesToMB(size_t bytes)
+{
+    double mb = bytes / (1024.0 * 1024.0);
+    char buf[64] = {};
+    sprintf_s(buf, "%.0f MB", mb);
+    return std::string(buf);
+}
+
+// New: lire une chaîne BIOS dans HKLM\HARDWARE\DESCRIPTION\System\BIOS
+std::string ReadBiosStringValue(const char* valueName)
+{
+    HKEY hKey;
+    const char* subKey = "HARDWARE\\DESCRIPTION\\System\\BIOS";
+
+    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, subKey, 0, KEY_READ, &hKey) != ERROR_SUCCESS) {
+        return "";
+    }
+
+    char buffer[256] = {};
+    DWORD bufferSize = sizeof(buffer);
+    DWORD type = 0;
+    LONG ret = RegGetValueA(
+        hKey,
+        nullptr,
+        valueName,
+        RRF_RT_REG_SZ,
+        &type,
+        buffer,
+        &bufferSize
+    );
+
+    RegCloseKey(hKey);
+
+    if (ret != ERROR_SUCCESS) {
+        return "";
+    }
+
+    return std::string(buffer);
+}
+
+// New: récupérer carte mère + BIOS depuis le registre BIOS [web:283]
+void InitMotherboardAndBiosInfo()
+{
+    // Ces valeurs existent souvent :
+    //   BaseBoardManufacturer, BaseBoardProduct
+    //   BIOSVersion, BIOSVendor, BIOSReleaseDate
+    g_mbVendor  = ReadBiosStringValue("BaseBoardManufacturer");
+    g_mbProduct = ReadBiosStringValue("BaseBoardProduct");
+    g_biosVersion = ReadBiosStringValue("BIOSVersion");
+
+    if (g_mbVendor.empty())  g_mbVendor  = "Unknown";
+    if (g_mbProduct.empty()) g_mbProduct = "Unknown";
+    if (g_biosVersion.empty()) g_biosVersion = "Unknown";
+}
+
+// -------- Classe DXGICapture --------
 
 class DXGICapture {
 public:
@@ -103,7 +199,7 @@ public:
             return hr;
         }
 
-        // GPU description
+        // GPU description + VRAM
         DXGI_ADAPTER_DESC adapterDesc;
         hr = adapter->GetDesc(&adapterDesc);
         if (SUCCEEDED(hr)) {
@@ -111,29 +207,9 @@ public:
             size_t converted = 0;
             wcstombs_s(&converted, gpuName, sizeof(gpuName), adapterDesc.Description, _TRUNCATE);
             g_gpuName = gpuName;
+
+            g_gpuVram = FormatBytesToMB(static_cast<size_t>(adapterDesc.DedicatedVideoMemory));
         }
-
-        // Driver version via CheckInterfaceSupport
-        // Driver version via CheckInterfaceSupport (DXGI UMD)
-        {
-            LARGE_INTEGER umdVersion = {};
-            HRESULT hrVer = adapter->CheckInterfaceSupport(__uuidof(IDXGIDevice), &umdVersion);
-            if (SUCCEEDED(hrVer)) {
-                UINT major    = HIWORD(umdVersion.HighPart);
-                UINT minor    = LOWORD(umdVersion.HighPart);
-                UINT build    = HIWORD(umdVersion.LowPart);
-                UINT revision = LOWORD(umdVersion.LowPart);
-
-                char drvBuf[64] = {};
-                sprintf_s(drvBuf, "%u.%u.%u.%u", major, minor, build, revision);
-                g_driverVersion = drvBuf;
-                printf("[DXGI] OK Driver UMD version: %s\n", drvBuf);
-            } else {
-                printf("[DXGI] INFO Could not query driver version (hr=0x%X)\n", hrVer);
-                g_driverVersion = "Unknown";
-            }
-        }
-
 
         ComPtr<IDXGIOutput> output;
         hr = adapter->EnumOutputs(0, output.ReleaseAndGetAddressOf());
@@ -312,9 +388,84 @@ private:
     }
 };
 
-// ==================== Main ====================
+// -------- Écriture dans un fichier --------
 
-static std::vector<int64_t> g_results;
+void WriteResultsToFile(
+    const char* path,
+    const std::string& osVersion,
+    const std::string& cpuCores,
+    double totalRamMB,
+    double frameTimeMs,
+    int refreshHz,
+    int64_t testDuration,
+    int intervalMs,
+    size_t sampleCount,
+    int64_t minNs,
+    int64_t medianNs,
+    int64_t avgNs,
+    int64_t p95Ns,
+    int64_t p99Ns,
+    int64_t maxNs,
+    double stdDev
+) {
+    if (!path || !*path) return;
+
+    FILE* f = nullptr;
+    if (fopen_s(&f, path, "w") != 0 || !f) {
+        printf("[WARN] Could not open output file: %s\n", path);
+        return;
+    }
+
+    double minMs    = minNs    / 1000000.0;
+    double medianMs = medianNs / 1000000.0;
+    double avgMs    = avgNs    / 1000000.0;
+    double p95Ms    = p95Ns    / 1000000.0;
+    double p99Ms    = p99Ns    / 1000000.0;
+    double maxMs    = maxNs    / 1000000.0;
+    double stdDevMs = stdDev   / 1000000.0;
+
+    double minFrames    = minMs    / frameTimeMs;
+    double medianFrames = medianMs / frameTimeMs;
+    double avgFrames    = avgMs    / frameTimeMs;
+    double p95Frames    = p95Ms    / frameTimeMs;
+    double p99Frames    = p99Ms    / frameTimeMs;
+    double maxFrames    = maxMs    / frameTimeMs;
+
+    fprintf(f, "inputlag-tester results\n\n");
+
+    // Bloc unique [SYS ]
+    fprintf(f, "[SYS ] CPU           : %s\n", g_cpuName.c_str());
+    fprintf(f, "[SYS ] CPU Cores     : %s\n", cpuCores.c_str());
+    fprintf(f, "[SYS ] RAM           : %.0f MB\n", totalRamMB);
+    fprintf(f, "[SYS ] OS            : %s\n", osVersion.c_str());
+    fprintf(f, "[SYS ] Motherboard   : %s %s\n", g_mbVendor.c_str(), g_mbProduct.c_str());
+    fprintf(f, "[SYS ] BIOS          : %s\n", g_biosVersion.c_str());
+    fprintf(f, "[SYS ] XMP Profile   : Unknown\n");
+    fprintf(f, "[SYS ] Resizable BAR : Unknown\n");
+    fprintf(f, "[SYS ] GPU           : %s\n", g_gpuName.empty() ? "Unknown GPU" : g_gpuName.c_str());
+    fprintf(f, "[SYS ] GPU VRAM      : %s\n", g_gpuVram.empty() ? "Unknown" : g_gpuVram.c_str());
+    fprintf(f, "[SYS ] Monitor       : %s\n", g_monitorName.empty() ? "Unknown Monitor" : g_monitorName.c_str());
+    fprintf(f, "[SYS ] Refresh Rate  : %d Hz\n\n", refreshHz);
+
+    fprintf(f, "[RESULTS]\n");
+    fprintf(f, "Samples       : %zu\n", sampleCount);
+    fprintf(f, "Min           : %.2f ms (%.2f frames)\n", minMs, minFrames);
+    fprintf(f, "P50 (Median)  : %.2f ms (%.2f frames)\n", medianMs, medianFrames);
+    fprintf(f, "Avg           : %.2f ms (%.2f frames)\n", avgMs, avgFrames);
+    fprintf(f, "P95           : %.2f ms (%.2f frames)\n", p95Ms, p95Frames);
+    fprintf(f, "P99           : %.2f ms (%.2f frames)\n", p99Ms, p99Frames);
+    fprintf(f, "Max           : %.2f ms (%.2f frames)\n", maxMs, maxFrames);
+    fprintf(f, "Std Dev       : %.2f ms\n\n", stdDevMs);
+
+    fprintf(f, "Test Duration : %lld ms\n", (long long)testDuration);
+    fprintf(f, "Interval      : %d ms\n", intervalMs);
+    fprintf(f, "Frame time    : %.2f ms\n", frameTimeMs);
+
+    fclose(f);
+    printf("[OK ] Results written to: %s\n", path);
+}
+
+// ==================== Main ====================
 
 int main(int argc, char** argv) {
     SetConsoleCP(CP_UTF8);
@@ -325,6 +476,16 @@ int main(int argc, char** argv) {
     printf("========================================\n\n");
 
     g_cpuName = GetCpuName();
+    std::string osVersion = GetOsVersionString();
+    std::string cpuCores  = GetCpuLogicalCoresString();
+
+    MEMORYSTATUSEX mem = {};
+    mem.dwLength = sizeof(mem);
+    GlobalMemoryStatusEx(&mem);
+    double totalRamMB = mem.ullTotalPhys / (1024.0 * 1024.0);
+
+    // New: lire carte mère / BIOS
+    InitMotherboardAndBiosInfo();
 
     int regionX = 0, regionY = 0, regionW = 0, regionH = 0;
     int numSamples = 210;
@@ -332,15 +493,17 @@ int main(int argc, char** argv) {
     int intervalMs = 50;
     int dx = 30;
 
-    for (int i = 1; i < argc - 1; i++) {
-        if (strcmp(argv[i], "-x") == 0) regionX = atoi(argv[++i]);
-        if (strcmp(argv[i], "-y") == 0) regionY = atoi(argv[++i]);
-        if (strcmp(argv[i], "-w") == 0) regionW = atoi(argv[++i]);
-        if (strcmp(argv[i], "-h") == 0) regionH = atoi(argv[++i]);
-        if (strcmp(argv[i], "-n") == 0) numSamples = atoi(argv[++i]);
-        if (strcmp(argv[i], "-warmup") == 0) warmupSamples = atoi(argv[++i]);
-        if (strcmp(argv[i], "-interval") == 0) intervalMs = atoi(argv[++i]);
-        if (strcmp(argv[i], "-dx") == 0) dx = atoi(argv[++i]);
+    // Parse args (secure)
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "-x") == 0 && i + 1 < argc) regionX = atoi(argv[++i]);
+        else if (strcmp(argv[i], "-y") == 0 && i + 1 < argc) regionY = atoi(argv[++i]);
+        else if (strcmp(argv[i], "-w") == 0 && i + 1 < argc) regionW = atoi(argv[++i]);
+        else if (strcmp(argv[i], "-h") == 0 && i + 1 < argc) regionH = atoi(argv[++i]);
+        else if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) numSamples = atoi(argv[++i]);
+        else if (strcmp(argv[i], "-warmup") == 0 && i + 1 < argc) warmupSamples = atoi(argv[++i]);
+        else if (strcmp(argv[i], "-interval") == 0 && i + 1 < argc) intervalMs = atoi(argv[++i]);
+        else if (strcmp(argv[i], "-dx") == 0 && i + 1 < argc) dx = atoi(argv[++i]);
+        else if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) g_outputFilePath = argv[++i];
     }
 
     printf("Config: dx=%d interval=%dms n=%d warmup=%d\n\n", dx, intervalMs, numSamples, warmupSamples);
@@ -488,10 +651,17 @@ int main(int argc, char** argv) {
     printf("              FINAL RESULTS               \n");
     printf("==========================================\n\n");
 
-    // ---- SYS block ----
+    // Bloc unique [SYS ]
     printf("[SYS ] CPU           : %s\n", g_cpuName.c_str());
+    printf("[SYS ] CPU Cores     : %s\n", cpuCores.c_str());
+    printf("[SYS ] RAM           : %.0f MB\n", totalRamMB);
+    printf("[SYS ] OS            : %s\n", osVersion.c_str());
+    printf("[SYS ] Motherboard   : %s %s\n", g_mbVendor.c_str(), g_mbProduct.c_str());
+    printf("[SYS ] BIOS          : %s\n", g_biosVersion.c_str());
+    printf("[SYS ] XMP Profile   : Unknown\n");
+    printf("[SYS ] Resizable BAR : Unknown\n");
     printf("[SYS ] GPU           : %s\n", g_gpuName.empty() ? "Unknown GPU" : g_gpuName.c_str());
-    printf("[SYS ] Driver        : %s\n", g_driverVersion.empty() ? "Unknown" : g_driverVersion.c_str());
+    printf("[SYS ] GPU VRAM      : %s\n", g_gpuVram.empty() ? "Unknown" : g_gpuVram.c_str());
     printf("[SYS ] Monitor       : %s\n", g_monitorName.empty() ? "Unknown Monitor" : g_monitorName.c_str());
     printf("[SYS ] Refresh Rate  : %d Hz\n\n", g_monitorHz > 0 ? g_monitorHz : capture.refreshRateHz);
 
@@ -519,7 +689,7 @@ int main(int argc, char** argv) {
     printf("\n");
 
     printf("[*] Test Characteristics\n");
-    printf("    Test Duration : %lld ms\n", testDuration);
+    printf("    Test Duration : %lld ms\n", (long long)testDuration);
     printf("    Measurement Rate : %.2f Hz\n", measurementRateHz);
     printf("    Interval      : %d ms\n\n", intervalMs);
 
@@ -530,6 +700,28 @@ int main(int argc, char** argv) {
     printf("      and DXGI detecting a frame change on Windows.\n");
     printf("      They do not include the exact display output time\n");
     printf("      (scan-out + panel response), which requires a hardware sensor.\n\n");
+
+    // Écriture fichier si demandée
+    if (!g_outputFilePath.empty()) {
+        WriteResultsToFile(
+            g_outputFilePath.c_str(),
+            osVersion,
+            cpuCores,
+            totalRamMB,
+            frameTimeMs,
+            capture.refreshRateHz,
+            testDuration,
+            intervalMs,
+            g_results.size(),
+            minNs,
+            medianNs,
+            avgNs,
+            p95Ns,
+            p99Ns,
+            maxNs,
+            stdDev
+        );
+    }
 
     return 0;
 }

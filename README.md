@@ -34,15 +34,68 @@ L'exécutable `inputlag-tester.exe` sera généré dans le répertoire courant.
 
 4. Go back to the game in less than 3 seconds
 
-### Options
+## Command-line options
 
-- `-n`            : total number of samples (default: 210)  
-- `-warmup`       : number of initial samples to ignore (default: 10)  
-- `-interval`     : delay between mouse moves in milliseconds (default: 50)  
-- `-x <X> -y <Y>` : top left corner of the capture region (0,0 = top left corner of the screen)
-  - default: `X=((screenWidth / 2) - (width / 2))` et `Y=((screenHeight / 2) - (height / 2))`
-- `-w <width> -h <height>` : capture region box size (default: 200x200 centered square)
-- `-dx`           : horizontal mouse movement amplitude (default: 30)
+All options are optional. Defaults are chosen to give a reasonable balance between test duration and statistical quality.
+
+### Region selection
+
+The capture region is where DXGI checks for the first frame change.
+
+- `-x <int>`  
+  Capture region top‑left X in pixels (desktop coordinates).  
+  Default: `0` (auto‑centered region if all four of `-x -y -w -h` are 0).
+
+- `-y <int>`  
+  Capture region top‑left Y in pixels.  
+  Default: `0`.
+
+- `-w <int>`  
+  Capture region width in pixels.  
+  Default: `0` → if all four (`-x -y -w -h`) are zero, the program will choose a `200x200` region centered on the primary monitor.
+
+- `-h <int>`  
+  Capture region height in pixels.  
+  Default: `0`.
+
+If the region would extend beyond the desktop, it is automatically clamped to the screen bounds.
+
+Default: `X=((screenWidth / 2) - (width / 2))` et `Y=((screenHeight / 2) - (height / 2))`
+
+### Sampling / timing
+
+- `-n <int>`  
+  Total number of measurement attempts.  
+  Each attempt sends one mouse move and waits for a screen change.  
+  Default: `210`.
+
+- `-warmup <int>`  
+  Number of initial attempts to discard as warm‑up.  
+  Warm‑up samples are executed but not included in the statistics.  
+  Default: `10`.
+
+- `-interval <int>`  
+  Interval between input events in milliseconds.  
+  The tool schedules each mouse move at `GetTickCount64() + interval`.  
+  Default: `50` ms.
+
+- `-dx <int>`  
+  Horizontal mouse movement (in mouse units) for each input event.  
+  The sign alternates every sample: `+dx, -dx, +dx, ...`  
+  Default: `30`.
+
+### Output
+
+- `-o <path>`  
+  Write a human‑readable summary to the given file path.  
+  The file contains the `[SYS ]` system block and all latency statistics (min, median, avg, percentiles, etc.).  
+  Example:
+
+  ```powershell
+  inputlag-tester.exe -n 300 -warmup 30 -interval 40 -dx 40 -o results.txt
+  ```
+
+If `-o` is not provided, the summary is printed only to the console.
 
 ## How to interpret results
 
@@ -67,7 +120,7 @@ Here an example for expected output (output from my computer, below my computer 
 - Windows 11 25H2
 
 ```powershell
-PS C:\Users\Vigne> C:\Users\Vigne\Downloads\inputlag-tester-windows-amd64\inputlag-tester.exe
+PS C:\Users\Vigne> PS Z:\sv\CODE\inputlag-tester> .\inputlag-tester.exe -interval 1ms -o results.txt
 
 ========================================
    inputlag-tester (Auto-Detect Hz)
@@ -88,36 +141,43 @@ Monitor: 360Hz (2.78 ms per frame)
 [2/210] Latency: 0.62 ms (0.22 frames)
 [3/210] Latency: 0.39 ms (0.14 frames)
 ...
-[209/210] Latency: 0.40 ms (0.14 frames)
-[210/210] Latency: 0.44 ms (0.16 frames)
+[209/210] Latency: 0.36 ms (0.13 frames)
+[210/210] Latency: 0.37 ms (0.13 frames)
 
 ==========================================
               FINAL RESULTS
 ==========================================
 
 [SYS ] CPU           : AMD Ryzen 7 7700X 8-Core Processor
+[SYS ] CPU Cores     : 16 logical cores
+[SYS ] RAM           : 31911 MB
+[SYS ] OS            : Windows 6.2 (build 9200)
+[SYS ] Motherboard   : ASUSTeK COMPUTER INC. TUF GAMING B650-PLUS
+[SYS ] BIOS          : 3287
+[SYS ] XMP Profile   : Unknown
+[SYS ] Resizable BAR : Unknown
 [SYS ] GPU           : NVIDIA GeForce RTX 4080
-[SYS ] Driver        : 32.0.15.9159
+[SYS ] GPU VRAM      : 16048 MB
 [SYS ] Monitor       : \\.\DISPLAY1
 [SYS ] Refresh Rate  : 360 Hz
 
 [*] Input -> DXGI Capture Latency (milliseconds)
     Samples       : 200
-    Min           : 0.34 ms (0.12 frames)
-    P50 (Median)  : 0.58 ms (0.21 frames)
-    Avg           : 0.60 ms (0.21 frames)
-    P95           : 0.83 ms (0.30 frames)
-    P99           : 1.06 ms (0.38 frames)
-    Max           : 1.17 ms (0.42 frames)
-    Std Dev       : 0.13 ms
+    Min           : 0.29 ms (0.10 frames)
+    P50 (Median)  : 0.52 ms (0.19 frames)
+    Avg           : 0.56 ms (0.20 frames)
+    P95           : 0.81 ms (0.29 frames)
+    P99           : 0.92 ms (0.33 frames)
+    Max           : 0.95 ms (0.34 frames)
+    Std Dev       : 0.14 ms
 
 [*] Monitor Analysis (360Hz)
     Frame time    : 2.78 ms
     Verdict       : EXCELLENT - Under 1 frame of lag
 
 [*] Test Characteristics
-    Test Duration : 6582 ms
-    Measurement Rate : 30.39 Hz
+    Test Duration : 6597 ms
+    Measurement Rate : 30.32 Hz
     Interval      : 1 ms
 
 [+] Test completed successfully
@@ -126,4 +186,6 @@ Note: these measurements represent the time between a mouse movement
       and DXGI detecting a frame change on Windows.
       They do not include the exact display output time
       (scan-out + panel response), which requires a hardware sensor.
+
+[OK ] Results written to: results.txt
 ```
