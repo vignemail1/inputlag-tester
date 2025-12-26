@@ -27,13 +27,12 @@ L'exécutable `inputlag-tester.exe` sera généré dans le répertoire courant.
 1. Vous lancez votre jeu
 2. Vous lancez un invite de commande ou Powershell
 3. drag-n-drop du fichier .exe dans la fenetre invite de commande puis vous complètez avec vos options si besoin
+    ```powershell
+    inputlag-tester.exe -n 100 -interval 200 -warmup 10
+    ```
 4. vous revenez vite dans le jeu (en moins de 3 secondes)
 
-```powershell
-inputlag-tester.exe -n 100 -interval 200 -warmup 10
-```
-
-Options :
+### Options
 
 - `-n` : nombre total de mesures (défaut: 210)
 - `-warmup` : échantillons ignorés au début (défaut: 10)
