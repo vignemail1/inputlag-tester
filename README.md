@@ -27,16 +27,18 @@ L'exécutable `inputlag-tester.exe` sera généré dans le répertoire courant.
 1. Launch your game and go to the firing range for example
 2. Launch an Command prompt or Powershell window
 3. drag-n-drop the .exe binary into the Command prompt window with additional options if needed
+
     ```powershell
     inputlag-tester.exe -n 100 -interval 200 -warmup 10
     ```
+
 4. Go back to the game in less than 3 seconds
 
 ### Options
 
-- `-n`            : total number of samples (default: 100)  
+- `-n`            : total number of samples (default: 210)  
 - `-warmup`       : number of initial samples to ignore (default: 10)  
-- `-interval`     : delay between mouse moves in milliseconds (default: 200)  
+- `-interval`     : delay between mouse moves in milliseconds (default: 50)  
 - `-x <X> -y <Y>` : top left corner of the capture region (0,0 = top left corner of the screen)
   - default: `X=((screenWidth / 2) - (width / 2))` et `Y=((screenHeight / 2) - (height / 2))`
 - `-w <width> -h <height>` : capture region box size (default: 200x200 centered square)
@@ -61,7 +63,7 @@ Here an example for expected output (output from my computer, below my computer 
 
 - AMD 7700x
 - Nvidia RTX 4080
-- écran ROG PG27AQN (dalle IPS 360Hz) en DisplayPort
+- écran ROG PG27AQN (IPS 360Hz screen) en DisplayPort
 - Windows 11 25H2
 
 ```powershell

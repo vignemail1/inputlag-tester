@@ -1,5 +1,5 @@
 // inputlag-tester.cpp - Auto-detect Monitor Refresh Rate (No Warnings)
-// Compile: cl /std:c++17 inputlag-tester.cpp /link dxgi.lib d3d11.lib kernel32.lib user32.lib
+// Compile: cl /std:c++17 inputlag-tester.cpp /link dxgi.lib d3d11.lib kernel32.lib user32.lib advapi32.lib
 
 #include <windows.h>
 #include <dxgi1_2.h>
@@ -12,14 +12,49 @@
 #include <vector>
 #include <algorithm>
 #include <cmath>
+#include <string>
+#include <winreg.h>
 
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "kernel32.lib")
 #pragma comment(lib, "user32.lib")
+#pragma comment(lib, "advapi32.lib")
 
 using Microsoft::WRL::ComPtr;
 using namespace std::chrono;
+
+std::string GetCpuName()
+{
+    HKEY hKey;
+    const char* subKey = "HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0";
+    const char* valueName = "ProcessorNameString";
+
+    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, subKey, 0, KEY_READ, &hKey) != ERROR_SUCCESS) {
+        return "Unknown CPU";
+    }
+
+    char buffer[256] = {};
+    DWORD bufferSize = sizeof(buffer);
+    DWORD type = 0;
+    LONG ret = RegGetValueA(
+        hKey,
+        nullptr,
+        valueName,
+        RRF_RT_REG_SZ,
+        &type,
+        buffer,
+        &bufferSize
+    );
+
+    RegCloseKey(hKey);
+
+    if (ret != ERROR_SUCCESS) {
+        return "Unknown CPU";
+    }
+
+    return std::string(buffer);
+}
 
 class DXGICapture {
 public:
@@ -61,6 +96,16 @@ public:
             return hr;
         }
 
+        // GPU description
+        DXGI_ADAPTER_DESC adapterDesc;
+        hr = adapter->GetDesc(&adapterDesc);
+        if (SUCCEEDED(hr)) {
+            char gpuName[128] = {};
+            size_t converted = 0;
+            wcstombs_s(&converted, gpuName, sizeof(gpuName), adapterDesc.Description, _TRUNCATE);
+            printf("[SYS ] GPU           : %s\n", gpuName);
+        }
+
         ComPtr<IDXGIOutput> output;
         hr = adapter->EnumOutputs(0, output.ReleaseAndGetAddressOf());
         if (FAILED(hr)) {
@@ -78,6 +123,11 @@ public:
             int screenHeight = outputDesc.DesktopCoordinates.bottom - outputDesc.DesktopCoordinates.top;
             printf("[DXGI] OK Screen resolution: %d x %d\n", screenWidth, screenHeight);
             printf("[DXGI] OK Detected refresh rate: %d Hz\n", refreshRateHz);
+
+            char monitorName[64] = {};
+            size_t converted2 = 0;
+            wcstombs_s(&converted2, monitorName, sizeof(monitorName), outputDesc.DeviceName, _TRUNCATE);
+            printf("[SYS ] Monitor       : %s\n", monitorName);
 
             if (regionX_ == 0 && regionY_ == 0 && regionW_ == 0 && regionH_ == 0) {
                 regionW_ = 200;
@@ -244,6 +294,9 @@ int main(int argc, char** argv) {
     printf("   inputlag-tester (Auto-Detect Hz)\n");
     printf("========================================\n\n");
 
+    std::string cpuName = GetCpuName();
+    printf("[SYS ] CPU           : %s\n", cpuName.c_str());
+
     int regionX = 0, regionY = 0, regionW = 0, regionH = 0;
     int numSamples = 210;
     int warmupSamples = 10;
@@ -368,14 +421,14 @@ int main(int argc, char** argv) {
     for (auto v : g_results) sumNs += v;
     int64_t avgNs = sumNs / static_cast<int64_t>(g_results.size());
 
-    // Calculate percentiles
+    // Percentiles
     size_t p95_idx = static_cast<size_t>(g_results.size() * 0.95);
     size_t p99_idx = static_cast<size_t>(g_results.size() * 0.99);
 
     int64_t p95Ns = (p95_idx < g_results.size()) ? g_results[p95_idx] : g_results.back();
     int64_t p99Ns = (p99_idx < g_results.size()) ? g_results[p99_idx] : g_results.back();
 
-    // Calculate median
+    // Median
     int64_t medianNs;
     if (g_results.size() % 2 == 0) {
         medianNs = (g_results[g_results.size()/2 - 1] + g_results[g_results.size()/2]) / 2;
@@ -383,7 +436,7 @@ int main(int argc, char** argv) {
         medianNs = g_results[g_results.size()/2];
     }
 
-    // Calculate std deviation
+    // Std dev
     double variance = 0.0;
     for (auto v : g_results) {
         double diff = static_cast<double>(v) - static_cast<double>(avgNs);
@@ -392,7 +445,7 @@ int main(int argc, char** argv) {
     variance /= g_results.size();
     double stdDev = sqrt(variance);
 
-    // Calculate measurement rate
+    // Measurement rate
     double measurementRateHz = (g_results.size() * 1000.0) / testDuration;
 
     // Frame calculations
@@ -402,10 +455,9 @@ int main(int argc, char** argv) {
     double maxFrames = (maxNs / 1000000.0) / frameTimeMs;
 
     printf("\n");
-    printf("\n========================================\n");
-    printf("   inputlag-tester (Auto-Detect Hz)\n");
-    printf("========================================\n\n");
-
+    printf("==========================================\n");
+    printf("              FINAL RESULTS               \n");
+    printf("==========================================\n\n");
     printf("[*] Input -> DXGI Capture Latency (milliseconds)\n");
     printf("    Samples       : %zu\n", g_results.size());
     printf("    Min           : %.2f ms (%.2f frames)\n", minNs / 1000000.0, minFrames);
@@ -419,13 +471,13 @@ int main(int argc, char** argv) {
     printf("[*] Monitor Analysis (%dHz)\n", capture.refreshRateHz);
     printf("    Frame time    : %.2f ms\n", frameTimeMs);
     if (avgFrames < 1.0) {
-        printf("    Verdict       : EXCELLENT - Under 1 frame lag\n");
+        printf("    Verdict       : EXCELLENT - Under 1 frame of lag\n");
     } else if (avgFrames < 2.0) {
-        printf("    Verdict       : VERY GOOD - Under 2 frames lag\n");
+        printf("    Verdict       : VERY GOOD - Under 2 frames of lag\n");
     } else if (avgFrames < 3.0) {
-        printf("    Verdict       : GOOD - Under 3 frames lag\n");
+        printf("    Verdict       : GOOD - Under 3 frames of lag\n");
     } else {
-        printf("    Verdict       : CHECK SETTINGS - Above 3 frames lag\n");
+        printf("    Verdict       : CHECK SETTINGS - Above 3 frames of lag\n");
     }
     printf("\n");
 
