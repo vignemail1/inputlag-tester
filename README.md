@@ -121,7 +121,7 @@ Here an example for expected output (output from my computer, below my computer 
 
 - AMD Ryzen 7 7700x 8-core
 - Nvidia GeForce RTX 4080
-- écran ROG PG27AQN (IPS 360Hz screen) en DisplayPort
+- ROG PG27AQN (IPS 360Hz screen), connected using DisplayPort
 - Windows 11 25H2
 
 ```powershell
