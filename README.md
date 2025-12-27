@@ -5,6 +5,8 @@ Small Windows utility to measure **input → DXGI capture** latency of a game or
 > ⚠️ Important: this program measures the time between a mouse movement and DXGI detecting a frame change on Windows.  
 > It does **not** directly measure the actual display output time (scan-out + panel response).
 
+also very important: **this tool doesn't work if you are performing a screen cloning**, it works when expanding screen.
+
 ## Features
 
 - Automatically detects monitor **refresh rate (Hz)** via DXGI
