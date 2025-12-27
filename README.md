@@ -22,7 +22,7 @@ also very important, this tool:
 Requirements: Visual Studio with C++ toolset (MSVC) or Visual Studio Build Tools.
 
 ```powershell
-cl /std:c++17 inputlag-tester.cpp /link dxgi.lib d3d11.lib kernel32.lib user32.lib
+cl /std:c++17 inputlag-tester.cpp /link dxgi.lib d3d11.lib kernel32.lib user32.lib advapi32.lib
 ```
 
 L'exécutable `inputlag-tester.exe` sera généré dans le répertoire courant.
