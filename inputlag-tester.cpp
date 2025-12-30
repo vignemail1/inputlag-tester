@@ -1,19 +1,21 @@
 // inputlag-tester.cpp - Auto-detect Monitor Refresh Rate (No Warnings)
+// Avec support multi-run avec --nb-run et --pause
+
 // Compile: cl /std:c++17 inputlag-tester.cpp /link dxgi.lib d3d11.lib kernel32.lib user32.lib advapi32.lib
 
 #include <windows.h>
+#include <dxgi.h>
 #include <dxgi1_2.h>
 #include <d3d11.h>
-#include <wrl/client.h>
-#include <cstdio>
-#include <cstring>
-#include <cstdint>
-#include <chrono>
+#include <wrl.h>
 #include <vector>
-#include <algorithm>
-#include <cmath>
 #include <string>
-#include <winreg.h>
+#include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <thread>
 
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "d3d11.lib")
@@ -31,128 +33,284 @@ static std::string g_monitorName;
 static std::string g_gpuVram;
 static int g_monitorHz = 0;
 
-// New: infos carte mère / BIOS
+// Infos carte mère / BIOS
 static std::string g_mbVendor;
 static std::string g_mbProduct;
 static std::string g_biosVersion;
 
 // Résultats + sortie fichier
 static std::vector<int64_t> g_results;
+static std::vector<std::vector<int64_t>> g_allResults;  // Stockage de tous les runs
 static std::string g_outputFilePath;
+
+// Configuration multi-run
+static int g_nbRun = 3;           // Nombre de runs (défaut: 3)
+static int g_pauseSeconds = 3;    // Pause entre les runs en secondes (défaut: 3)
+static bool g_verbose = false;    // Affichage des samples (défaut: false)
+
+// -------- Forward declarations --------
+
+std::string GetCpuLogicalCoresString();
+std::string GetOsVersionString();
+// -------- Fonction d'analyse des arguments --------
+
+void PrintUsage(const char* programName) {
+    printf("\n=== Input Lag Tester - Usage ===\n");
+    printf("  %s [OPTIONS]\n\n", programName);
+    printf("Options:\n");
+    printf("  -x NUM              Region X coordinate (default: auto-center)\n");
+    printf("  -y NUM              Region Y coordinate (default: auto-center)\n");
+    printf("  -w NUM              Region width (default: 200)\n");
+    printf("  -h NUM              Region height (default: 200)\n");
+    printf("  -n NUM              Number of samples (default: 210)\n");
+    printf("  -warmup NUM         Warmup samples (default: 10)\n");
+    printf("  -interval NUM       Interval between tests in ms (default: 50)\n");
+    printf("  -dx NUM             Mouse movement distance (default: 30)\n");
+    printf("  -o FILE             Output file path (default: none)\n");
+    printf("  --nb-run NUM        Number of test runs (default: 3)\n");
+    printf("  --pause SECONDS     Pause between runs in seconds (default: 3)\n");
+    printf("  -v                  Verbose mode - display each sample (default: off)\n");
+    printf("  --help              Show this help message\n\n");
+    printf("Examples:\n");
+    printf("  %s --nb-run 5 --pause 2 -n 100\n", programName);
+    printf("  %s --nb-run 10 -interval 25 -v\n", programName);
+    printf("  %s -o results.txt -v\n", programName);
+}
+
+bool ParseCommandLineArgs(int argc, char* argv[]) {
+    for (int i = 1; i < argc; i++) {
+        std::string arg = argv[i];
+        
+        if (arg == "--help" || arg == "-h" || arg == "/?") {
+            PrintUsage(argv[0]);
+            return false;
+        }
+        else if (arg == "-v") {
+            g_verbose = true;
+            printf("[CONFIG] Verbose mode enabled\n");
+        }
+        else if (arg == "--nb-run" && i + 1 < argc) {
+            g_nbRun = std::atoi(argv[++i]);
+            if (g_nbRun < 1) {
+                printf("[ERROR] --nb-run must be >= 1\n");
+                return false;
+            }
+            printf("[CONFIG] NB_RUN set to %d\n", g_nbRun);
+        }
+        else if (arg == "--pause" && i + 1 < argc) {
+            g_pauseSeconds = std::atoi(argv[++i]);
+            if (g_pauseSeconds < 0) {
+                printf("[ERROR] --pause must be >= 0\n");
+                return false;
+            }
+            printf("[CONFIG] PAUSE set to %d seconds\n", g_pauseSeconds);
+        }
+    }
+    return true;
+}
+
+// -------- Fonction de calcul des moyennes --------
+
+void PrintAverageResults() {
+    if (g_allResults.empty()) {
+        printf("\n[STATS] No results to average\n");
+        return;
+    }
+
+    printf("\n");
+    printf("==========================================\n");
+    printf(" AVERAGE RESULTS OVER %d RUNS\n", (int)g_allResults.size());
+    printf("==========================================\n\n");
+    
+    // Calculer les statistiques globales
+    std::vector<int64_t> allLatencies;
+    for (const auto& runResults : g_allResults) {
+        for (const auto& latency : runResults) {
+            allLatencies.push_back(latency);
+        }
+    }
+    
+    if (allLatencies.empty()) {
+        printf("[STATS] No latency data collected\n");
+        return;
+    }
+    
+    std::sort(allLatencies.begin(), allLatencies.end());
+    
+    int64_t minNs = allLatencies.front();
+    int64_t maxNs = allLatencies.back();
+    
+    int64_t sumNs = 0;
+    for (auto v : allLatencies) sumNs += v;
+    int64_t avgNs = sumNs / static_cast<int64_t>(allLatencies.size());
+    
+    // Percentiles
+    size_t p95_idx = static_cast<size_t>(allLatencies.size() * 0.95);
+    size_t p99_idx = static_cast<size_t>(allLatencies.size() * 0.99);
+    int64_t p95Ns = (p95_idx < allLatencies.size()) ? allLatencies[p95_idx] : allLatencies.back();
+    int64_t p99Ns = (p99_idx < allLatencies.size()) ? allLatencies[p99_idx] : allLatencies.back();
+    
+    // Median
+    int64_t medianNs;
+    if (allLatencies.size() % 2 == 0) {
+        medianNs = (allLatencies[allLatencies.size()/2 - 1] + allLatencies[allLatencies.size()/2]) / 2;
+    } else {
+        medianNs = allLatencies[allLatencies.size()/2];
+    }
+    
+    // Std dev
+    double variance = 0.0;
+    for (auto v : allLatencies) {
+        double diff = static_cast<double>(v) - static_cast<double>(avgNs);
+        variance += diff * diff;
+    }
+    variance /= allLatencies.size();
+    double stdDev = sqrt(variance);
+    
+    // Affichage des résultats moyens
+    double frameTimeMs = 1000.0 / g_monitorHz;
+    
+    printf("[*] System Information\n");
+    printf(" CPU      : %s\n", g_cpuName.c_str());
+    printf(" CPU Cores: %s\n", GetCpuLogicalCoresString().c_str());
+    MEMORYSTATUSEX mem = {};
+    mem.dwLength = sizeof(mem);
+    GlobalMemoryStatusEx(&mem);
+    printf(" RAM      : %.0f MB\n", mem.ullTotalPhys / (1024.0 * 1024.0));
+    printf(" OS       : %s\n", GetOsVersionString().c_str());
+    printf(" MB       : %s %s\n", g_mbVendor.c_str(), g_mbProduct.c_str());
+    printf(" BIOS     : %s\n", g_biosVersion.c_str());
+    printf(" GPU      : %s (%s)\n", g_gpuName.empty() ? "Unknown" : g_gpuName.c_str(), 
+                                     g_gpuVram.empty() ? "Unknown" : g_gpuVram.c_str());
+    printf(" Monitor  : %s @ %d Hz\n\n", g_monitorName.empty() ? "Unknown" : g_monitorName.c_str(), g_monitorHz);
+    
+    printf("[*] Global Statistics Over %zu Measurements\n", allLatencies.size());
+    printf(" Samples    : %zu\n", allLatencies.size());
+    printf(" Min        : %.2f ms (%.2f frames)\n", minNs / 1000000.0, (minNs / 1000000.0) / frameTimeMs);
+    printf(" P50 (Med)  : %.2f ms (%.2f frames)\n", medianNs / 1000000.0, (medianNs / 1000000.0) / frameTimeMs);
+    printf(" Avg        : %.2f ms (%.2f frames)\n", avgNs / 1000000.0, (avgNs / 1000000.0) / frameTimeMs);
+    printf(" P95        : %.2f ms (%.2f frames)\n", p95Ns / 1000000.0, (p95Ns / 1000000.0) / frameTimeMs);
+    printf(" P99        : %.2f ms (%.2f frames)\n", p99Ns / 1000000.0, (p99Ns / 1000000.0) / frameTimeMs);
+    printf(" Max        : %.2f ms (%.2f frames)\n", maxNs / 1000000.0, (maxNs / 1000000.0) / frameTimeMs);
+    printf(" Std Dev    : %.2f ms\n\n", stdDev / 1000000.0);
+    
+    // Statistiques par run
+    printf("[*] Per-Run Statistics\n");
+    for (size_t runIdx = 0; runIdx < g_allResults.size(); runIdx++) {
+        const auto& runResults = g_allResults[runIdx];
+        if (runResults.empty()) continue;
+        
+        std::vector<int64_t> sorted = runResults;
+        std::sort(sorted.begin(), sorted.end());
+        
+        int64_t runMin = sorted.front();
+        int64_t runMax = sorted.back();
+        
+        int64_t runSum = 0;
+        for (auto v : sorted) runSum += v;
+        int64_t runAvg = runSum / static_cast<int64_t>(sorted.size());
+        
+        // P50 and P99
+        int64_t runP50 = sorted[sorted.size() / 2];
+        size_t p99_idx_run = static_cast<size_t>(sorted.size() * 0.99);
+        int64_t runP99 = (p99_idx_run < sorted.size()) ? sorted[p99_idx_run] : sorted.back();
+        
+        printf("  Run %zu: Min=%.2f, P50=%.2f, Avg=%.2f, P99=%.2f, Max=%.2f ms, Samples=%zu\n",
+               runIdx + 1,
+               runMin / 1000000.0,
+               runP50 / 1000000.0,
+               runAvg / 1000000.0,
+               runP99 / 1000000.0,
+               runMax / 1000000.0,
+               sorted.size());
+    }
+    printf("\n");
+}
 
 // -------- Helpers système --------
 
-std::string GetCpuName()
-{
+std::string GetCpuName() {
     HKEY hKey;
     const char* subKey = "HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0";
     const char* valueName = "ProcessorNameString";
-
+    
     if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, subKey, 0, KEY_READ, &hKey) != ERROR_SUCCESS) {
         return "Unknown CPU";
     }
-
+    
     char buffer[256] = {};
     DWORD bufferSize = sizeof(buffer);
     DWORD type = 0;
-    LONG ret = RegGetValueA(
-        hKey,
-        nullptr,
-        valueName,
-        RRF_RT_REG_SZ,
-        &type,
-        buffer,
-        &bufferSize
-    );
-
+    LONG ret = RegGetValueA(hKey, nullptr, valueName, RRF_RT_REG_SZ, &type, buffer, &bufferSize);
     RegCloseKey(hKey);
-
+    
     if (ret != ERROR_SUCCESS) {
         return "Unknown CPU";
     }
-
+    
     return std::string(buffer);
 }
 
-std::string GetOsVersionString()
-{
+std::string GetOsVersionString() {
     OSVERSIONINFOEXA osvi = {};
     osvi.dwOSVersionInfoSize = sizeof(osvi);
+    
 #pragma warning(push)
-#pragma warning(disable:4996) // GetVersionEx deprecated warning
+#pragma warning(disable:4996)
     if (!GetVersionExA((OSVERSIONINFOA*)&osvi)) {
 #pragma warning(pop)
         return "Unknown OS";
     }
-
+    
     char buf[128] = {};
     sprintf_s(buf, "Windows %lu.%lu (build %lu)",
-              osvi.dwMajorVersion,
-              osvi.dwMinorVersion,
-              osvi.dwBuildNumber);
+        osvi.dwMajorVersion, osvi.dwMinorVersion, osvi.dwBuildNumber);
     return std::string(buf);
 }
 
-std::string GetCpuLogicalCoresString()
-{
+std::string GetCpuLogicalCoresString() {
     SYSTEM_INFO si = {};
     GetSystemInfo(&si);
+    
     char buf[64] = {};
     sprintf_s(buf, "%u logical cores", si.dwNumberOfProcessors);
     return std::string(buf);
 }
 
-std::string FormatBytesToMB(size_t bytes)
-{
+std::string FormatBytesToMB(size_t bytes) {
     double mb = bytes / (1024.0 * 1024.0);
     char buf[64] = {};
     sprintf_s(buf, "%.0f MB", mb);
     return std::string(buf);
 }
 
-// New: lire une chaîne BIOS dans HKLM\HARDWARE\DESCRIPTION\System\BIOS
-std::string ReadBiosStringValue(const char* valueName)
-{
+std::string ReadBiosStringValue(const char* valueName) {
     HKEY hKey;
     const char* subKey = "HARDWARE\\DESCRIPTION\\System\\BIOS";
-
+    
     if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, subKey, 0, KEY_READ, &hKey) != ERROR_SUCCESS) {
         return "";
     }
-
+    
     char buffer[256] = {};
     DWORD bufferSize = sizeof(buffer);
     DWORD type = 0;
-    LONG ret = RegGetValueA(
-        hKey,
-        nullptr,
-        valueName,
-        RRF_RT_REG_SZ,
-        &type,
-        buffer,
-        &bufferSize
-    );
-
+    LONG ret = RegGetValueA(hKey, nullptr, valueName, RRF_RT_REG_SZ, &type, buffer, &bufferSize);
     RegCloseKey(hKey);
-
+    
     if (ret != ERROR_SUCCESS) {
         return "";
     }
-
+    
     return std::string(buffer);
 }
 
-// New: récupérer carte mère + BIOS depuis le registre BIOS [web:283]
-void InitMotherboardAndBiosInfo()
-{
-    // Ces valeurs existent souvent :
-    //   BaseBoardManufacturer, BaseBoardProduct
-    //   BIOSVersion, BIOSVendor, BIOSReleaseDate
-    g_mbVendor  = ReadBiosStringValue("BaseBoardManufacturer");
+void InitMotherboardAndBiosInfo() {
+    g_mbVendor = ReadBiosStringValue("BaseBoardManufacturer");
     g_mbProduct = ReadBiosStringValue("BaseBoardProduct");
     g_biosVersion = ReadBiosStringValue("BIOSVersion");
-
-    if (g_mbVendor.empty())  g_mbVendor  = "Unknown";
+    
+    if (g_mbVendor.empty()) g_mbVendor = "Unknown";
     if (g_mbProduct.empty()) g_mbProduct = "Unknown";
     if (g_biosVersion.empty()) g_biosVersion = "Unknown";
 }
@@ -162,14 +320,14 @@ void InitMotherboardAndBiosInfo()
 class DXGICapture {
 public:
     int refreshRateHz;
-
+    
     HRESULT init(int regionX, int regionY, int regionW, int regionH) {
         regionX_ = regionX;
         regionY_ = regionY;
         regionW_ = regionW;
         regionH_ = regionH;
-        refreshRateHz = 60; // default fallback
-
+        refreshRateHz = 60;
+        
         D3D_FEATURE_LEVEL featureLevels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
         HRESULT hr = D3D11CreateDevice(
             nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr,
@@ -180,25 +338,26 @@ public:
             nullptr,
             context_.ReleaseAndGetAddressOf()
         );
+        
         if (FAILED(hr)) {
             printf("[DXGI] ERROR D3D11CreateDevice failed: 0x%X\n", hr);
             return hr;
         }
-
+        
         ComPtr<IDXGIDevice> dxgiDevice;
         hr = device_.As(&dxgiDevice);
         if (FAILED(hr)) {
             printf("[DXGI] ERROR device.As failed: 0x%X\n", hr);
             return hr;
         }
-
+        
         ComPtr<IDXGIAdapter> adapter;
         hr = dxgiDevice->GetAdapter(adapter.ReleaseAndGetAddressOf());
         if (FAILED(hr)) {
             printf("[DXGI] ERROR GetAdapter failed: 0x%X\n", hr);
             return hr;
         }
-
+        
         // GPU description + VRAM
         DXGI_ADAPTER_DESC adapterDesc;
         hr = adapter->GetDesc(&adapterDesc);
@@ -207,20 +366,19 @@ public:
             size_t converted = 0;
             wcstombs_s(&converted, gpuName, sizeof(gpuName), adapterDesc.Description, _TRUNCATE);
             g_gpuName = gpuName;
-
             g_gpuVram = FormatBytesToMB(static_cast<size_t>(adapterDesc.DedicatedVideoMemory));
         }
-
+        
         ComPtr<IDXGIOutput> output;
         hr = adapter->EnumOutputs(0, output.ReleaseAndGetAddressOf());
         if (FAILED(hr)) {
             printf("[DXGI] ERROR EnumOutputs failed: 0x%X\n", hr);
             return hr;
         }
-
+        
         // Detect refresh rate from output modes
         detectRefreshRate(output.Get());
-
+        
         DXGI_OUTPUT_DESC outputDesc;
         hr = output->GetDesc(&outputDesc);
         if (SUCCEEDED(hr)) {
@@ -228,13 +386,13 @@ public:
             int screenHeight = outputDesc.DesktopCoordinates.bottom - outputDesc.DesktopCoordinates.top;
             printf("[DXGI] OK Screen resolution: %d x %d\n", screenWidth, screenHeight);
             printf("[DXGI] OK Detected refresh rate: %d Hz\n", refreshRateHz);
-
+            
             char monitorName[64] = {};
             size_t converted2 = 0;
             wcstombs_s(&converted2, monitorName, sizeof(monitorName), outputDesc.DeviceName, _TRUNCATE);
             g_monitorName = monitorName;
-            g_monitorHz   = refreshRateHz;
-
+            g_monitorHz = refreshRateHz;
+            
             if (regionX_ == 0 && regionY_ == 0 && regionW_ == 0 && regionH_ == 0) {
                 regionW_ = 200;
                 regionH_ = 200;
@@ -249,51 +407,51 @@ public:
                     regionX_, regionY_, regionW_, regionH_);
             }
         }
-
+        
         ComPtr<IDXGIOutput1> output1;
         hr = output.As(&output1);
         if (FAILED(hr)) {
-            printf("[DXGI] ERROR output.As<IDXGIOutput1> failed: 0x%X\n", hr);
+            printf("[DXGI] ERROR output.As failed: 0x%X\n", hr);
             return hr;
         }
-
+        
         hr = output1->DuplicateOutput(device_.Get(), duplication_.ReleaseAndGetAddressOf());
         if (FAILED(hr)) {
             printf("[DXGI] ERROR DuplicateOutput failed: 0x%X\n", hr);
             return hr;
         }
-
+        
         printf("[DXGI] OK Desktop Duplication initialized\n");
         return S_OK;
     }
-
+    
     HRESULT captureFrameWithTimestamp(uint32_t& checksumOut, int64_t& timestampNsOut) {
         ComPtr<IDXGIResource> desktopResource;
         DXGI_OUTDUPL_FRAME_INFO frameInfo;
-
-        // Capture timestamp BEFORE AcquireNextFrame
+        
         int64_t captureTimeNs = duration_cast<nanoseconds>(
             high_resolution_clock::now().time_since_epoch()
         ).count();
-
+        
         HRESULT hr = duplication_->AcquireNextFrame(10, &frameInfo, desktopResource.ReleaseAndGetAddressOf());
         if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
             return hr;
         }
+        
         if (FAILED(hr)) {
             return hr;
         }
-
+        
         ComPtr<ID3D11Texture2D> texture;
         hr = desktopResource.As(&texture);
         if (FAILED(hr)) {
             duplication_->ReleaseFrame();
             return hr;
         }
-
+        
         D3D11_TEXTURE2D_DESC desc;
         texture->GetDesc(&desc);
-
+        
         if (!stagingTexture_) {
             D3D11_TEXTURE2D_DESC stagingDesc = desc;
             stagingDesc.Usage = D3D11_USAGE_STAGING;
@@ -305,38 +463,38 @@ public:
                 return hr;
             }
         }
-
+        
         context_->CopyResource(stagingTexture_.Get(), texture.Get());
-
+        
         D3D11_MAPPED_SUBRESOURCE mapped;
         hr = context_->Map(stagingTexture_.Get(), 0, D3D11_MAP_READ, 0, &mapped);
         if (FAILED(hr)) {
             duplication_->ReleaseFrame();
             return hr;
         }
-
+        
         uint32_t checksum = checksumRegion(
             (uint8_t*)mapped.pData,
             mapped.RowPitch,
             regionX_, regionY_, regionW_, regionH_
         );
-
+        
         context_->Unmap(stagingTexture_.Get(), 0);
         duplication_->ReleaseFrame();
-
+        
         checksumOut = checksum;
         timestampNsOut = captureTimeNs;
+        
         return S_OK;
     }
-
+    
 private:
     ComPtr<ID3D11Device> device_;
     ComPtr<ID3D11DeviceContext> context_;
     ComPtr<IDXGIOutputDuplication> duplication_;
     ComPtr<ID3D11Texture2D> stagingTexture_;
-
     int regionX_, regionY_, regionW_, regionH_;
-
+    
     uint32_t checksumRegion(uint8_t* data, int pitch, int x, int y, int w, int h) {
         uint32_t sum = 0;
         for (int py = y; py < y + h; py += 4) {
@@ -349,7 +507,7 @@ private:
         }
         return sum;
     }
-
+    
     void detectRefreshRate(IDXGIOutput* output) {
         ComPtr<IDXGIOutput1> output1;
         HRESULT hr = output->QueryInterface(IID_PPV_ARGS(&output1));
@@ -357,23 +515,21 @@ private:
             printf("[DXGI] INFO Could not get IDXGIOutput1 for refresh rate detection\n");
             return;
         }
-
-        // Query for matching modes
+        
         UINT numModes = 0;
         hr = output1->GetDisplayModeList(DXGI_FORMAT_B8G8R8A8_UNORM, 0, &numModes, nullptr);
         if (FAILED(hr) || numModes == 0) {
             printf("[DXGI] INFO Could not enumerate display modes\n");
             return;
         }
-
+        
         std::vector<DXGI_MODE_DESC> modes(numModes);
         hr = output1->GetDisplayModeList(DXGI_FORMAT_B8G8R8A8_UNORM, 0, &numModes, modes.data());
         if (FAILED(hr)) {
             printf("[DXGI] INFO Could not get display mode list\n");
             return;
         }
-
-        // Find the highest refresh rate
+        
         int maxRefreshRate = 60;
         for (UINT i = 0; i < numModes; i++) {
             if (modes[i].RefreshRate.Numerator > 0 && modes[i].RefreshRate.Denominator > 0) {
@@ -383,7 +539,6 @@ private:
                 }
             }
         }
-
         refreshRateHz = maxRefreshRate;
     }
 };
@@ -409,58 +564,57 @@ void WriteResultsToFile(
     double stdDev
 ) {
     if (!path || !*path) return;
-
+    
     FILE* f = nullptr;
     if (fopen_s(&f, path, "w") != 0 || !f) {
         printf("[WARN] Could not open output file: %s\n", path);
         return;
     }
-
-    double minMs    = minNs    / 1000000.0;
+    
+    double minMs = minNs / 1000000.0;
     double medianMs = medianNs / 1000000.0;
-    double avgMs    = avgNs    / 1000000.0;
-    double p95Ms    = p95Ns    / 1000000.0;
-    double p99Ms    = p99Ns    / 1000000.0;
-    double maxMs    = maxNs    / 1000000.0;
-    double stdDevMs = stdDev   / 1000000.0;
-
-    double minFrames    = minMs    / frameTimeMs;
+    double avgMs = avgNs / 1000000.0;
+    double p95Ms = p95Ns / 1000000.0;
+    double p99Ms = p99Ns / 1000000.0;
+    double maxMs = maxNs / 1000000.0;
+    double stdDevMs = stdDev / 1000000.0;
+    
+    double minFrames = minMs / frameTimeMs;
     double medianFrames = medianMs / frameTimeMs;
-    double avgFrames    = avgMs    / frameTimeMs;
-    double p95Frames    = p95Ms    / frameTimeMs;
-    double p99Frames    = p99Ms    / frameTimeMs;
-    double maxFrames    = maxMs    / frameTimeMs;
-
+    double avgFrames = avgMs / frameTimeMs;
+    double p95Frames = p95Ms / frameTimeMs;
+    double p99Frames = p99Ms / frameTimeMs;
+    double maxFrames = maxMs / frameTimeMs;
+    
     fprintf(f, "inputlag-tester results\n\n");
-
-    // Bloc unique [SYS ]
-    fprintf(f, "[SYS ] CPU           : %s\n", g_cpuName.c_str());
-    fprintf(f, "[SYS ] CPU Cores     : %s\n", cpuCores.c_str());
-    fprintf(f, "[SYS ] RAM           : %.0f MB\n", totalRamMB);
-    fprintf(f, "[SYS ] OS            : %s\n", osVersion.c_str());
-    fprintf(f, "[SYS ] Motherboard   : %s %s\n", g_mbVendor.c_str(), g_mbProduct.c_str());
-    fprintf(f, "[SYS ] BIOS          : %s\n", g_biosVersion.c_str());
-    fprintf(f, "[SYS ] XMP Profile   : Unknown\n");
+    
+    fprintf(f, "[SYS ] CPU : %s\n", g_cpuName.c_str());
+    fprintf(f, "[SYS ] CPU Cores : %s\n", cpuCores.c_str());
+    fprintf(f, "[SYS ] RAM : %.0f MB\n", totalRamMB);
+    fprintf(f, "[SYS ] OS : %s\n", osVersion.c_str());
+    fprintf(f, "[SYS ] Motherboard : %s %s\n", g_mbVendor.c_str(), g_mbProduct.c_str());
+    fprintf(f, "[SYS ] BIOS : %s\n", g_biosVersion.c_str());
+    fprintf(f, "[SYS ] XMP Profile : Unknown\n");
     fprintf(f, "[SYS ] Resizable BAR : Unknown\n");
-    fprintf(f, "[SYS ] GPU           : %s\n", g_gpuName.empty() ? "Unknown GPU" : g_gpuName.c_str());
-    fprintf(f, "[SYS ] GPU VRAM      : %s\n", g_gpuVram.empty() ? "Unknown" : g_gpuVram.c_str());
-    fprintf(f, "[SYS ] Monitor       : %s\n", g_monitorName.empty() ? "Unknown Monitor" : g_monitorName.c_str());
-    fprintf(f, "[SYS ] Refresh Rate  : %d Hz\n\n", refreshHz);
-
+    fprintf(f, "[SYS ] GPU : %s\n", g_gpuName.empty() ? "Unknown GPU" : g_gpuName.c_str());
+    fprintf(f, "[SYS ] GPU VRAM : %s\n", g_gpuVram.empty() ? "Unknown" : g_gpuVram.c_str());
+    fprintf(f, "[SYS ] Monitor : %s\n", g_monitorName.empty() ? "Unknown Monitor" : g_monitorName.c_str());
+    fprintf(f, "[SYS ] Refresh Rate : %d Hz\n\n", refreshHz);
+    
     fprintf(f, "[RESULTS]\n");
-    fprintf(f, "Samples       : %zu\n", sampleCount);
-    fprintf(f, "Min           : %.2f ms (%.2f frames)\n", minMs, minFrames);
-    fprintf(f, "P50 (Median)  : %.2f ms (%.2f frames)\n", medianMs, medianFrames);
-    fprintf(f, "Avg           : %.2f ms (%.2f frames)\n", avgMs, avgFrames);
-    fprintf(f, "P95           : %.2f ms (%.2f frames)\n", p95Ms, p95Frames);
-    fprintf(f, "P99           : %.2f ms (%.2f frames)\n", p99Ms, p99Frames);
-    fprintf(f, "Max           : %.2f ms (%.2f frames)\n", maxMs, maxFrames);
-    fprintf(f, "Std Dev       : %.2f ms\n\n", stdDevMs);
-
+    fprintf(f, "Samples : %zu\n", sampleCount);
+    fprintf(f, "Min : %.2f ms (%.2f frames)\n", minMs, minFrames);
+    fprintf(f, "P50 (Median) : %.2f ms (%.2f frames)\n", medianMs, medianFrames);
+    fprintf(f, "Avg : %.2f ms (%.2f frames)\n", avgMs, avgFrames);
+    fprintf(f, "P95 : %.2f ms (%.2f frames)\n", p95Ms, p95Frames);
+    fprintf(f, "P99 : %.2f ms (%.2f frames)\n", p99Ms, p99Frames);
+    fprintf(f, "Max : %.2f ms (%.2f frames)\n", maxMs, maxFrames);
+    fprintf(f, "Std Dev : %.2f ms\n\n", stdDevMs);
+    
     fprintf(f, "Test Duration : %lld ms\n", (long long)testDuration);
-    fprintf(f, "Interval      : %d ms\n", intervalMs);
-    fprintf(f, "Frame time    : %.2f ms\n", frameTimeMs);
-
+    fprintf(f, "Interval : %d ms\n", intervalMs);
+    fprintf(f, "Frame time : %.2f ms\n", frameTimeMs);
+    
     fclose(f);
     printf("[OK ] Results written to: %s\n", path);
 }
@@ -470,44 +624,51 @@ void WriteResultsToFile(
 int main(int argc, char** argv) {
     SetConsoleCP(CP_UTF8);
     SetConsoleOutputCP(CP_UTF8);
-
+    
     printf("\n========================================\n");
-    printf("   inputlag-tester (Auto-Detect Hz)\n");
+    printf(" inputlag-tester (Auto-Detect Hz)\n");
+    printf(" Multi-Run Version\n");
     printf("========================================\n\n");
-
+    
+    // Parser les arguments AVANT
+    if (!ParseCommandLineArgs(argc, argv)) {
+        return 1;
+    }
+    
     g_cpuName = GetCpuName();
     std::string osVersion = GetOsVersionString();
-    std::string cpuCores  = GetCpuLogicalCoresString();
-
+    std::string cpuCores = GetCpuLogicalCoresString();
+    
     MEMORYSTATUSEX mem = {};
     mem.dwLength = sizeof(mem);
     GlobalMemoryStatusEx(&mem);
     double totalRamMB = mem.ullTotalPhys / (1024.0 * 1024.0);
-
-    // New: lire carte mère / BIOS
+    
     InitMotherboardAndBiosInfo();
-
+    
     int regionX = 0, regionY = 0, regionW = 0, regionH = 0;
     int numSamples = 210;
     int warmupSamples = 10;
     int intervalMs = 50;
     int dx = 30;
-
-    // Parse args (secure)
+    
+    // Parse standard args
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "-x") == 0 && i + 1 < argc) regionX = atoi(argv[++i]);
-        else if (strcmp(argv[i], "-y") == 0 && i + 1 < argc) regionY = atoi(argv[++i]);
-        else if (strcmp(argv[i], "-w") == 0 && i + 1 < argc) regionW = atoi(argv[++i]);
-        else if (strcmp(argv[i], "-h") == 0 && i + 1 < argc) regionH = atoi(argv[++i]);
-        else if (strcmp(argv[i], "-n") == 0 && i + 1 < argc) numSamples = atoi(argv[++i]);
-        else if (strcmp(argv[i], "-warmup") == 0 && i + 1 < argc) warmupSamples = atoi(argv[++i]);
-        else if (strcmp(argv[i], "-interval") == 0 && i + 1 < argc) intervalMs = atoi(argv[++i]);
-        else if (strcmp(argv[i], "-dx") == 0 && i + 1 < argc) dx = atoi(argv[++i]);
-        else if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) g_outputFilePath = argv[++i];
+        std::string arg = argv[i];
+        
+        if (arg == "-x" && i + 1 < argc) regionX = atoi(argv[++i]);
+        else if (arg == "-y" && i + 1 < argc) regionY = atoi(argv[++i]);
+        else if (arg == "-w" && i + 1 < argc) regionW = atoi(argv[++i]);
+        else if (arg == "-h" && i + 1 < argc) regionH = atoi(argv[++i]);
+        else if (arg == "-n" && i + 1 < argc) numSamples = atoi(argv[++i]);
+        else if (arg == "-warmup" && i + 1 < argc) warmupSamples = atoi(argv[++i]);
+        else if (arg == "-interval" && i + 1 < argc) intervalMs = atoi(argv[++i]);
+        else if (arg == "-dx" && i + 1 < argc) dx = atoi(argv[++i]);
+        else if (arg == "-o" && i + 1 < argc) g_outputFilePath = argv[++i];
     }
-
+    
     printf("Config: dx=%d interval=%dms n=%d warmup=%d\n\n", dx, intervalMs, numSamples, warmupSamples);
-
+    
     // Initialize DXGI
     DXGICapture capture;
     HRESULT hr = capture.init(regionX, regionY, regionW, regionH);
@@ -515,192 +676,170 @@ int main(int argc, char** argv) {
         printf("[ERROR] Capture init failed: 0x%X\n", hr);
         return 1;
     }
-
+    
     double frameTimeMs = 1000.0 / capture.refreshRateHz;
     printf("Monitor: %dHz (%.2f ms per frame)\n\n", capture.refreshRateHz, frameTimeMs);
-
-    printf("[OK] Starting test in 3 seconds...\n");
-    Sleep(3000);
-
-    printf("[OK] Measurements starting (pure DXGI-based)...\n\n");
-
-    int sampleCount = 0;
-    uint32_t baselineChecksum = 0;
-    ULONGLONG nextInputTime = GetTickCount64() + intervalMs;
-    auto testStartTime = high_resolution_clock::now();
-
-    // Get baseline checksum
-    int64_t dummyTs = 0;
-    capture.captureFrameWithTimestamp(baselineChecksum, dummyTs);
-
-    while (sampleCount < numSamples) {
-        if (GetTickCount64() >= nextInputTime) {
-            // Send input
-            INPUT inp = {};
-            inp.type = INPUT_MOUSE;
-            inp.mi.dx = (sampleCount % 2 == 0) ? dx : -dx;
-            inp.mi.dy = 0;
-            inp.mi.dwFlags = MOUSEEVENTF_MOVE;
-
-            int64_t inputTimeNs = duration_cast<nanoseconds>(
-                high_resolution_clock::now().time_since_epoch()
-            ).count();
-
-            SendInput(1, &inp, sizeof(INPUT));
-
-            // Poll for screen change
-            bool found = false;
-            int waitCount = 0;
-            while (waitCount < 1000 && !found) {
-                uint32_t checksum = 0;
-                int64_t captureTimeNs = 0;
-                HRESULT captureHr = capture.captureFrameWithTimestamp(checksum, captureTimeNs);
-
-                if (SUCCEEDED(captureHr) && checksum != baselineChecksum) {
-                    // Screen changed, calculate latency
-                    int64_t latencyNs = captureTimeNs - inputTimeNs;
-
-                    if (latencyNs > 0 && latencyNs < 500000000) { // 0-500ms reasonable range
-                        if (sampleCount >= warmupSamples) {
-                            g_results.push_back(latencyNs);
+    
+    printf("\n========================================\n");
+    printf(" STARTING MULTI-RUN TEST\n");
+    printf(" Number of runs: %d\n", g_nbRun);
+    printf(" Pause between runs: %d seconds\n", g_pauseSeconds);
+    printf("========================================\n\n");
+    
+    // ========== BOUCLE SUR LES RUNS ==========
+    
+    for (int runNumber = 1; runNumber <= g_nbRun; runNumber++) {
+        printf("\n===============================================\n");
+        printf(" RUN %d / %d\n", runNumber, g_nbRun);
+        printf("===============================================\n\n");
+        
+        g_results.clear();  // Réinitialiser pour ce run
+        
+        printf("[OK] Starting test in 3 seconds...\n");
+        Sleep(3000);
+        
+        printf("[OK] Measurements starting...\n\n");
+        
+        int sampleCount = 0;
+        uint32_t baselineChecksum = 0;
+        ULONGLONG nextInputTime = GetTickCount64() + intervalMs;
+        
+        // Get baseline checksum
+        int64_t dummyTs = 0;
+        capture.captureFrameWithTimestamp(baselineChecksum, dummyTs);
+        
+        while (sampleCount < numSamples) {
+            if (GetTickCount64() >= nextInputTime) {
+                // Send input
+                INPUT inp = {};
+                inp.type = INPUT_MOUSE;
+                inp.mi.dx = (sampleCount % 2 == 0) ? dx : -dx;
+                inp.mi.dy = 0;
+                inp.mi.dwFlags = MOUSEEVENTF_MOVE;
+                
+                int64_t inputTimeNs = duration_cast<nanoseconds>(
+                    high_resolution_clock::now().time_since_epoch()
+                ).count();
+                
+                SendInput(1, &inp, sizeof(INPUT));
+                
+                // Poll for screen change
+                bool found = false;
+                int waitCount = 0;
+                
+                while (waitCount < 1000 && !found) {
+                    uint32_t checksum = 0;
+                    int64_t captureTimeNs = 0;
+                    HRESULT captureHr = capture.captureFrameWithTimestamp(checksum, captureTimeNs);
+                    
+                    if (SUCCEEDED(captureHr) && checksum != baselineChecksum) {
+                        int64_t latencyNs = captureTimeNs - inputTimeNs;
+                        
+                        if (latencyNs > 0 && latencyNs < 500000000) {
+                            if (sampleCount >= warmupSamples) {
+                                g_results.push_back(latencyNs);
+                            }
+                            
+                            sampleCount++;
+                            double latencyMs = latencyNs / 1000000.0;
+                            double frames = latencyMs / frameTimeMs;
+                            
+                            if (g_verbose) {
+                                printf("[%d/%d] Latency: %.2f ms (%.2f frames)\n", 
+                                    sampleCount, numSamples, latencyMs, frames);
+                            }
+                            
+                            baselineChecksum = checksum;
+                            found = true;
                         }
-                        sampleCount++;
-
-                        double latencyMs = latencyNs / 1000000.0;
-                        double frames = latencyMs / frameTimeMs;
-                        printf("[%d/%d] Latency: %.2f ms (%.2f frames)\n", sampleCount, numSamples, latencyMs, frames);
-
-                        baselineChecksum = checksum;
-                        found = true;
                     }
+                    
+                    Sleep(1);
+                    waitCount++;
                 }
-
-                Sleep(1);
-                waitCount++;
+                
+                if (!found) {
+                    sampleCount++;
+                    printf("[%d/%d] No screen change detected\n", sampleCount, numSamples);
+                }
+                
+                nextInputTime = GetTickCount64() + intervalMs;
             }
-
-            if (!found) {
-                sampleCount++;
-                printf("[%d/%d] No screen change detected\n", sampleCount, numSamples);
+            
+            Sleep(1);
+            MSG msg;
+            while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
             }
-
-            nextInputTime = GetTickCount64() + intervalMs;
         }
-
-        Sleep(1);
-
-        MSG msg;
-        while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
+        
+        printf("\n[RUN %d] Test completed: %zu samples collected\n\n", runNumber, g_results.size());
+        
+        // Sauvegarder les résultats de ce run
+        g_allResults.push_back(g_results);
+        
+        // Pause avant le prochain run (sauf après le dernier)
+        if (runNumber < g_nbRun) {
+            printf("[PAUSE] Waiting %d seconds before next run...\n", g_pauseSeconds);
+            for (int i = g_pauseSeconds; i > 0; i--) {
+                printf("  %d...\n", i);
+                Sleep(1000);
+            }
         }
     }
-
-    // Calculate stats
-    if (g_results.empty()) {
+    
+    // ========== FIN DES RUNS ==========
+    
+    printf("\n\n========================================\n");
+    printf(" ALL RUNS COMPLETED\n");
+    printf("========================================\n");
+    
+    // Afficher les résultats moyens
+    PrintAverageResults();
+    
+    // Calcul des stats globales pour écriture fichier
+    std::vector<int64_t> allLatencies;
+    for (const auto& runResults : g_allResults) {
+        for (const auto& latency : runResults) {
+            allLatencies.push_back(latency);
+        }
+    }
+    
+    if (allLatencies.empty()) {
         printf("\n[ERROR] No valid measurements collected\n");
         return 1;
     }
-
-    auto testEndTime = high_resolution_clock::now();
-    auto testDuration = duration_cast<milliseconds>(testEndTime - testStartTime).count();
-
-    std::sort(g_results.begin(), g_results.end());
-
-    int64_t minNs = g_results.front();
-    int64_t maxNs = g_results.back();
+    
+    std::sort(allLatencies.begin(), allLatencies.end());
+    
+    int64_t minNs = allLatencies.front();
+    int64_t maxNs = allLatencies.back();
+    
     int64_t sumNs = 0;
-    for (auto v : g_results) sumNs += v;
-    int64_t avgNs = sumNs / static_cast<int64_t>(g_results.size());
-
-    // Percentiles
-    size_t p95_idx = static_cast<size_t>(g_results.size() * 0.95);
-    size_t p99_idx = static_cast<size_t>(g_results.size() * 0.99);
-
-    int64_t p95Ns = (p95_idx < g_results.size()) ? g_results[p95_idx] : g_results.back();
-    int64_t p99Ns = (p99_idx < g_results.size()) ? g_results[p99_idx] : g_results.back();
-
-    // Median
+    for (auto v : allLatencies) sumNs += v;
+    int64_t avgNs = sumNs / static_cast<int64_t>(allLatencies.size());
+    
+    size_t p95_idx = static_cast<size_t>(allLatencies.size() * 0.95);
+    size_t p99_idx = static_cast<size_t>(allLatencies.size() * 0.99);
+    int64_t p95Ns = (p95_idx < allLatencies.size()) ? allLatencies[p95_idx] : allLatencies.back();
+    int64_t p99Ns = (p99_idx < allLatencies.size()) ? allLatencies[p99_idx] : allLatencies.back();
+    
     int64_t medianNs;
-    if (g_results.size() % 2 == 0) {
-        medianNs = (g_results[g_results.size()/2 - 1] + g_results[g_results.size()/2]) / 2;
+    if (allLatencies.size() % 2 == 0) {
+        medianNs = (allLatencies[allLatencies.size()/2 - 1] + allLatencies[allLatencies.size()/2]) / 2;
     } else {
-        medianNs = g_results[g_results.size()/2];
+        medianNs = allLatencies[allLatencies.size()/2];
     }
-
-    // Std dev
+    
     double variance = 0.0;
-    for (auto v : g_results) {
+    for (auto v : allLatencies) {
         double diff = static_cast<double>(v) - static_cast<double>(avgNs);
         variance += diff * diff;
     }
-    variance /= g_results.size();
+    variance /= allLatencies.size();
     double stdDev = sqrt(variance);
-
-    // Measurement rate
-    double measurementRateHz = (g_results.size() * 1000.0) / testDuration;
-
-    // Frame calculations
-    double minFrames = (minNs / 1000000.0) / frameTimeMs;
-    double avgFrames = (avgNs / 1000000.0) / frameTimeMs;
-    double p95Frames = (p95Ns / 1000000.0) / frameTimeMs;
-    double maxFrames = (maxNs / 1000000.0) / frameTimeMs;
-
-    printf("\n");
-    printf("==========================================\n");
-    printf("              FINAL RESULTS               \n");
-    printf("==========================================\n\n");
-
-    // Bloc unique [SYS ]
-    printf("[SYS ] CPU           : %s\n", g_cpuName.c_str());
-    printf("[SYS ] CPU Cores     : %s\n", cpuCores.c_str());
-    printf("[SYS ] RAM           : %.0f MB\n", totalRamMB);
-    printf("[SYS ] OS            : %s\n", osVersion.c_str());
-    printf("[SYS ] Motherboard   : %s %s\n", g_mbVendor.c_str(), g_mbProduct.c_str());
-    printf("[SYS ] BIOS          : %s\n", g_biosVersion.c_str());
-    printf("[SYS ] XMP Profile   : Unknown\n");
-    printf("[SYS ] Resizable BAR : Unknown\n");
-    printf("[SYS ] GPU           : %s\n", g_gpuName.empty() ? "Unknown GPU" : g_gpuName.c_str());
-    printf("[SYS ] GPU VRAM      : %s\n", g_gpuVram.empty() ? "Unknown" : g_gpuVram.c_str());
-    printf("[SYS ] Monitor       : %s\n", g_monitorName.empty() ? "Unknown Monitor" : g_monitorName.c_str());
-    printf("[SYS ] Refresh Rate  : %d Hz\n\n", g_monitorHz > 0 ? g_monitorHz : capture.refreshRateHz);
-
-    printf("[*] Input -> DXGI Capture Latency (milliseconds)\n");
-    printf("    Samples       : %zu\n", g_results.size());
-    printf("    Min           : %.2f ms (%.2f frames)\n", minNs / 1000000.0, minFrames);
-    printf("    P50 (Median)  : %.2f ms (%.2f frames)\n", medianNs / 1000000.0, (medianNs / 1000000.0) / frameTimeMs);
-    printf("    Avg           : %.2f ms (%.2f frames)\n", avgNs / 1000000.0, avgFrames);
-    printf("    P95           : %.2f ms (%.2f frames)\n", p95Ns / 1000000.0, p95Frames);
-    printf("    P99           : %.2f ms (%.2f frames)\n", p99Ns / 1000000.0, (p99Ns / 1000000.0) / frameTimeMs);
-    printf("    Max           : %.2f ms (%.2f frames)\n", maxNs / 1000000.0, maxFrames);
-    printf("    Std Dev       : %.2f ms\n\n", stdDev / 1000000.0);
-
-    printf("[*] Monitor Analysis (%dHz)\n", capture.refreshRateHz);
-    printf("    Frame time    : %.2f ms\n", frameTimeMs);
-    if (avgFrames < 1.0) {
-        printf("    Verdict       : EXCELLENT - Under 1 frame of lag\n");
-    } else if (avgFrames < 2.0) {
-        printf("    Verdict       : VERY GOOD - Under 2 frames of lag\n");
-    } else if (avgFrames < 3.0) {
-        printf("    Verdict       : GOOD - Under 3 frames of lag\n");
-    } else {
-        printf("    Verdict       : CHECK SETTINGS - Above 3 frames of lag\n");
-    }
-    printf("\n");
-
-    printf("[*] Test Characteristics\n");
-    printf("    Test Duration : %lld ms\n", (long long)testDuration);
-    printf("    Measurement Rate : %.2f Hz\n", measurementRateHz);
-    printf("    Interval      : %d ms\n\n", intervalMs);
-
-    printf("[+] Test completed successfully\n\n");
-
-    // Simple context explanation
-    printf("Note: these measurements represent the time between a mouse movement\n");
-    printf("      and DXGI detecting a frame change on Windows.\n");
-    printf("      They do not include the exact display output time\n");
-    printf("      (scan-out + panel response), which requires a hardware sensor.\n\n");
-
+    
     // Écriture fichier si demandée
     if (!g_outputFilePath.empty()) {
         WriteResultsToFile(
@@ -710,9 +849,9 @@ int main(int argc, char** argv) {
             totalRamMB,
             frameTimeMs,
             capture.refreshRateHz,
-            testDuration,
+            0,
             intervalMs,
-            g_results.size(),
+            allLatencies.size(),
             minNs,
             medianNs,
             avgNs,
@@ -722,6 +861,8 @@ int main(int argc, char** argv) {
             stdDev
         );
     }
-
+    
+    printf("\n[+] Test completed successfully\n\n");
+    
     return 0;
 }
