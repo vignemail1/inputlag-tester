@@ -4,7 +4,7 @@
 
 CL = cl
 CPPFLAGS = /std:c++17 /W4 /O2 /EHsc
-LDLIBS = dxgi.lib d3d11.lib kernel32.lib user32.lib advapi32.lib
+LDLIBS = dxgi.lib d3d11.lib kernel32.lib user32.lib advapi32.lib gdi32.lib
 
 CPP_SRC = inputlag-tester.cpp
 CPP_EXE = inputlag-tester.exe
